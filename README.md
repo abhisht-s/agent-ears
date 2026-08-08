@@ -1,3 +1,11 @@
+# What agent-ears is:
+
+agent-ears is an attempt to give AI agents a way to understand musical audio, not just spoken language.
+
+Today, agents are already very good at understanding speech and text, but musical intent is still difficult to communicate naturally. A video editor may hum the exact part of a song they want to cut to. A producer may imitate a bassline, whistle a melody, or beatbox a rhythm instead of describing it in words.
+
+agent-ears aims to turn those human musical expressions into structured, source-grounded understanding that an AI agent can use. 
+
 # Music Locator V0.0.1
 
 An evidence-preserving local passage locator for 4–12 second monophonic hum,
