@@ -1,0 +1,55 @@
+[build-system]
+requires = ["uv_build==0.12.2"]
+build-backend = "uv_build"
+
+[project]
+name = "music-locator"
+version = "0.0.1"
+description = "Evidence-preserving local melodic passage locator"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+authors = [{ name = "Music Locator contributors" }]
+dependencies = [
+  "librosa==0.11.0",
+  "mido==1.3.3",
+  "numpy==2.2.6",
+  "pydantic==2.11.7",
+  "scipy==1.15.3",
+  "soundfile==0.13.1",
+  "typer==0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.17.1",
+  "pytest==8.4.1",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.7",
+]
+
+[project.scripts]
+music-locator = "music_locator.cli:app"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["music_locator"]
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["librosa.*", "mido.*", "scipy.*", "soundfile.*"]
+ignore_missing_imports = true
