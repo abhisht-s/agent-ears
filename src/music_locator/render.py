@@ -10,7 +10,7 @@ import numpy as np
 import soundfile as sf
 
 from music_locator.indexing import load_track_representation
-from music_locator.models import AssetKind
+from music_locator.models import AssetKind, AudioTargetArtifact, DecodedReferenceManifest
 from music_locator.search import load_search_result
 from music_locator.storage import Workspace
 from music_locator.targets import load_target
@@ -21,25 +21,48 @@ RENDER_SAMPLE_RATE = 44_100
 
 def render_match(workspace: Workspace, search_id: str, destination: Path) -> str:
     result, _ = load_search_result(workspace, search_id)
-    if (
-        result.selected_target_id is None
-        or result.selected_track_index is None
-        or result.target_range is None
-    ):
+    if result.selected_target_id is None:
         raise ValueError("search has no selected target passage to render")
     target, _ = load_target(workspace, result.selected_target_id)
-    selected_representation = (
-        load_track_representation(
-            workspace, result.provenance.target_representation_artifact_id
+    if isinstance(target, AudioTargetArtifact):
+        if (
+            result.target_sample_range is None
+            or result.provenance is None
+            or result.provenance.target_decode_manifest_artifact_id is None
+        ):
+            raise ValueError("audio search has no decoded source passage to render")
+        manifest = DecodedReferenceManifest.model_validate(
+            workspace.load_artifact_json(result.provenance.target_decode_manifest_artifact_id)
         )
+        with sf.SoundFile(workspace.asset_path(manifest.decoded_asset_id)) as reference:
+            reference.seek(result.target_sample_range.start_sample)
+            audio = reference.read(
+                result.target_sample_range.end_sample - result.target_sample_range.start_sample,
+                dtype="float32",
+                always_2d=True,
+            )
+            sample_rate = reference.samplerate
+        memory = io.BytesIO()
+        sf.write(memory, audio, sample_rate, format="WAV", subtype="FLOAT")
+        data = memory.getvalue()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        asset = workspace.store_asset(
+            data,
+            kind=AssetKind.RENDER,
+            media_type="audio/wav",
+            original_name=destination.name,
+        )
+        return asset.asset_id
+    if result.selected_track_index is None or result.target_range is None:
+        raise ValueError("MIDI search has no selected target passage to render")
+    selected_representation = (
+        load_track_representation(workspace, result.provenance.target_representation_artifact_id)
         if result.provenance is not None
         and result.provenance.target_representation_artifact_id is not None
         else None
     )
-    if (
-        selected_representation is not None
-        and selected_representation.voice_hypothesis is not None
-    ):
+    if selected_representation is not None and selected_representation.voice_hypothesis is not None:
         source_notes = {note.event_id: note for note in target.notes}
         selected_notes = [
             source_notes[item.source_event_id].model_copy(

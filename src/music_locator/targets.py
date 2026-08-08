@@ -1,4 +1,4 @@
-"""Authoritative MIDI and timed-note target ingestion."""
+"""Authoritative MIDI, timed-note, and encoded-audio target ingestion."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import mido
 
 from music_locator.models import (
     AssetKind,
+    AudioTargetArtifact,
     RawMidiEvent,
     TargetArtifact,
     TargetKind,
@@ -20,6 +21,19 @@ from music_locator.models import (
 )
 from music_locator.storage import Workspace, new_id, utc_now
 from music_locator.timebase import normalize_tempo_map
+
+AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+}
+
+LoadedTarget = TargetArtifact | AudioTargetArtifact
 
 
 def _json_safe_fields(message: Any) -> dict[str, int | str | bool]:
@@ -112,6 +126,8 @@ def parse_midi(path: Path, target_id: str, asset_id: str, sha256: str) -> Target
 
 def import_target(workspace: Workspace, path: Path, *, name: str | None = None) -> str:
     workspace.initialize()
+    if not path.is_file():
+        raise ValueError(f"target path is not a file: {path}")
     suffix = path.suffix.lower()
     target_id = new_id("target")
     if suffix in {".mid", ".midi"}:
@@ -143,8 +159,46 @@ def import_target(workspace: Workspace, path: Path, *, name: str | None = None) 
             ),
             source_sha256=asset.sha256,
         )
+    elif suffix in AUDIO_MEDIA_TYPES:
+        asset = workspace.store_asset(
+            path,
+            kind=AssetKind.TARGET_AUDIO,
+            media_type=AUDIO_MEDIA_TYPES[suffix],
+            original_name=path.name,
+        )
+        audio_target = AudioTargetArtifact(
+            target_id=target_id,
+            name=path.stem,
+            asset_id=asset.asset_id,
+            original_name=path.name,
+            media_type=asset.media_type,
+            source_sha256=asset.sha256,
+            byte_length=asset.byte_length,
+        )
+        if name is not None:
+            audio_target = audio_target.model_copy(update={"name": name})
+        artifact_id = workspace.store_json_artifact(
+            audio_target, artifact_type="target.encoded_audio"
+        )
+        workspace.database.execute(
+            """
+            INSERT INTO targets(target_id, name, kind, source_asset_id, artifact_id,
+                                ticks_per_beat, created_at)
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                audio_target.target_id,
+                audio_target.name,
+                audio_target.kind.value,
+                audio_target.asset_id,
+                artifact_id,
+                utc_now(),
+            ),
+        )
+        return audio_target.target_id
     else:
-        raise ValueError("supported target formats are .mid, .midi, and timed-note .json")
+        formats = ", ".join((".mid", ".midi", ".json", *AUDIO_MEDIA_TYPES))
+        raise ValueError(f"supported target formats are: {formats}")
     if name is not None:
         target = target.model_copy(update={"name": name})
     artifact_id = workspace.store_json_artifact(target, artifact_type="target.timed_notes")
@@ -167,17 +221,27 @@ def import_target(workspace: Workspace, path: Path, *, name: str | None = None) 
     return target.target_id
 
 
-def load_target(workspace: Workspace, target_id: str) -> tuple[TargetArtifact, str]:
+def load_target(workspace: Workspace, target_id: str) -> tuple[LoadedTarget, str]:
     row = workspace.database.fetchone(
-        "SELECT artifact_id FROM targets WHERE target_id = ?", (target_id,)
+        "SELECT artifact_id, kind FROM targets WHERE target_id = ?", (target_id,)
     )
     if row is None:
         raise KeyError(f"unknown target: {target_id}")
     artifact_id = str(row["artifact_id"])
-    return TargetArtifact.model_validate(workspace.load_artifact_json(artifact_id)), artifact_id
+    payload = workspace.load_artifact_json(artifact_id)
+    if str(row["kind"]) == TargetKind.AUDIO.value:
+        return AudioTargetArtifact.model_validate(payload), artifact_id
+    return TargetArtifact.model_validate(payload), artifact_id
 
 
-def list_targets(workspace: Workspace) -> list[tuple[TargetArtifact, str]]:
+def load_midi_target(workspace: Workspace, target_id: str) -> tuple[TargetArtifact, str]:
+    target, artifact_id = load_target(workspace, target_id)
+    if isinstance(target, AudioTargetArtifact):
+        raise ValueError(f"target is real audio, not MIDI/timed notes: {target_id}")
+    return target, artifact_id
+
+
+def list_targets(workspace: Workspace) -> list[tuple[LoadedTarget, str]]:
     rows = workspace.database.fetchall(
         "SELECT target_id FROM targets ORDER BY created_at, target_id"
     )

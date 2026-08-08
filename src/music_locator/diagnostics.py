@@ -35,7 +35,7 @@ from music_locator.search import (
     load_search_result,
 )
 from music_locator.storage import Workspace
-from music_locator.targets import load_target
+from music_locator.targets import load_midi_target
 from music_locator.timebase import tick_to_microseconds
 
 JsonObject = dict[str, Any]
@@ -46,7 +46,7 @@ RetrievalBucket = tuple[str, str, int]
 def _diagnostic_target(workspace: Workspace, target_id: str) -> TargetArtifact:
     """Avoid repeatedly decoding a target's potentially large raw-event artifact."""
 
-    return load_target(workspace, target_id)[0]
+    return load_midi_target(workspace, target_id)[0]
 
 
 def _rounded(value: float, digits: int = 6) -> float:
@@ -124,11 +124,14 @@ def _interpretation_report(
     interpretation: QueryInterpretation, *, analysis_rate: int, source_rate: int
 ) -> JsonObject:
     representation = interpretation.representation
-    iois = [right - left for left, right in zip(
-        representation.onset_samples,
-        representation.onset_samples[1:],
-        strict=False,
-    )]
+    iois = [
+        right - left
+        for left, right in zip(
+            representation.onset_samples,
+            representation.onset_samples[1:],
+            strict=False,
+        )
+    ]
     events = [
         _event_report(
             event,
@@ -194,9 +197,7 @@ def _side_by_side(
 
 def _f0_summary(frames: list[JsonObject], analysis_rate: int) -> JsonObject:
     voiced = [
-        frame
-        for frame in frames
-        if bool(frame.get("voiced")) and frame.get("f0_hz") is not None
+        frame for frame in frames if bool(frame.get("voiced")) and frame.get("f0_hz") is not None
     ]
     frequencies = [float(frame["f0_hz"]) for frame in voiced]
     midi_cents = [float(frame["midi_cents"]) for frame in voiced]
@@ -341,9 +342,7 @@ def _retrieval_replay(
     )
     if "phrase_shingles" in index.parameters:
         keys.extend(
-            phrase_shingle_keys(
-                [event.pitch_midi_cents for event in interpretation.events]
-            )
+            phrase_shingle_keys([event.pitch_midi_cents for event in interpretation.events])
         )
     votes: dict[RetrievalBucket, int] = defaultdict(int)
     weighted_votes: dict[RetrievalBucket, float] = defaultdict(float)
@@ -445,9 +444,7 @@ def _pitch_timing_components(
     target_position = (target_onset_us - target_first_us) / max(target_span_us, 1)
     timing_absolute = abs(query_position - target_position)
     timing_cost = (
-        timing_absolute / 0.12
-        if timing_absolute <= 0.12
-        else 1.0 + (timing_absolute - 0.12) * 8.0
+        timing_absolute / 0.12 if timing_absolute <= 0.12 else 1.0 + (timing_absolute - 0.12) * 8.0
     )
     quality = max(0.2, query.quality_weight)
     return (
@@ -583,9 +580,7 @@ def _cost_contributions(
     persisted_total = sum(pair.local_cost for pair in pairs)
     replay_total = sum(buckets.values())
     return {
-        "exclusive_raw_dp_cost_buckets": {
-            key: _rounded(value) for key, value in buckets.items()
-        },
+        "exclusive_raw_dp_cost_buckets": {key: _rounded(value) for key, value in buckets.items()},
         "local_cost_by_transition": {
             key: _rounded(value) for key, value in sorted(transition_totals.items())
         },
@@ -616,9 +611,7 @@ def _path_report(
             {
                 "index": index,
                 "event_id": interpretation.events[index].event_id,
-                "pitch_midi": _rounded(
-                    interpretation.events[index].pitch_midi_cents / 100.0
-                ),
+                "pitch_midi": _rounded(interpretation.events[index].pitch_midi_cents / 100.0),
                 "start_seconds": _seconds(interpretation.events[index].start_sample, 22_050),
                 "quality_weight": _rounded(interpretation.events[index].quality_weight),
             }
@@ -629,9 +622,7 @@ def _path_report(
                 "index": index,
                 "event_id": representation.event_ids[index],
                 "pitch_midi": _rounded(representation.pitch_cents[index] / 100.0),
-                "onset_seconds": _microseconds_to_seconds(
-                    representation.onset_microseconds[index]
-                ),
+                "onset_seconds": _microseconds_to_seconds(representation.onset_microseconds[index]),
                 "start_tick": representation.start_ticks[index],
                 "end_tick": representation.end_ticks[index],
             }
@@ -912,17 +903,13 @@ def _expected_passage_report(
                 ),
                 "forced_expected_score": _rounded(forced_score),
                 "forced_minus_selected_score": (
-                    _rounded(forced_score - selected_score)
-                    if selected_score is not None
-                    else None
+                    _rounded(forced_score - selected_score) if selected_score is not None else None
                 ),
             }
             item["forced_exact_window_alignment"] = forced_report
         voices.append(item)
     scored = [
-        item
-        for item in voices
-        if isinstance(item.get("forced_exact_window_alignment"), dict)
+        item for item in voices if isinstance(item.get("forced_exact_window_alignment"), dict)
     ]
     scored.sort(
         key=lambda item: float(item["forced_exact_window_alignment"]["score"]["value"]),
@@ -936,9 +923,7 @@ def _expected_passage_report(
             "end": _rounded(expected_end),
         },
         "overlapping_voice_count": len(voices),
-        "best_forced_voice_id": (
-            scored[0]["voice"]["voice_id"] if scored else None
-        ),
+        "best_forced_voice_id": (scored[0]["voice"]["voice_id"] if scored else None),
         "best_forced_score": (
             _rounded(float(scored[0]["forced_exact_window_alignment"]["score"]["value"]))
             if scored
@@ -1020,9 +1005,7 @@ def diagnose_search(
         and result.provenance.search_interpretation_artifact_id is not None
     ):
         selected = QueryInterpretation.model_validate(
-            workspace.load_artifact_json(
-                result.provenance.search_interpretation_artifact_id
-            )
+            workspace.load_artifact_json(result.provenance.search_interpretation_artifact_id)
         )
     pitch_payload = workspace.load_artifact_json(analysis.pitch_frames_artifact_id)
     onset_payload = workspace.load_artifact_json(analysis.onsets_artifact_id)

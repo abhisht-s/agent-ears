@@ -222,6 +222,90 @@ CREATE TABLE IF NOT EXISTS jobs (
 """
 
 
+MIGRATION_002 = """
+PRAGMA foreign_keys = OFF;
+BEGIN IMMEDIATE;
+
+ALTER TABLE alignments RENAME TO alignments_v001;
+ALTER TABLE targets RENAME TO targets_v001;
+
+CREATE TABLE targets (
+    target_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    ticks_per_beat INTEGER,
+    created_at TEXT NOT NULL,
+    CHECK (
+        (kind = 'audio' AND ticks_per_beat IS NULL)
+        OR (kind IN ('midi', 'timed_notes') AND ticks_per_beat > 0)
+    )
+);
+
+CREATE TABLE alignments (
+    alignment_id TEXT PRIMARY KEY,
+    search_id TEXT NOT NULL REFERENCES searches(search_id),
+    target_id TEXT NOT NULL REFERENCES targets(target_id),
+    rank INTEGER NOT NULL CHECK (rank > 0),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    uncalibrated_score REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(search_id, rank)
+);
+
+INSERT INTO targets(target_id, name, kind, source_asset_id, artifact_id,
+                    ticks_per_beat, created_at)
+SELECT target_id, name, kind, source_asset_id, artifact_id,
+       ticks_per_beat, created_at
+FROM targets_v001;
+
+INSERT INTO alignments(alignment_id, search_id, target_id, rank, artifact_id,
+                       uncalibrated_score, created_at)
+SELECT alignment_id, search_id, target_id, rank, artifact_id,
+       uncalibrated_score, created_at
+FROM alignments_v001;
+
+DROP TABLE alignments_v001;
+DROP TABLE targets_v001;
+
+CREATE TABLE target_decodes (
+    decode_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL REFERENCES targets(target_id),
+    cache_key TEXT NOT NULL UNIQUE,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id),
+    manifest_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    time_map_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    decoded_asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    decoded_stream_id TEXT NOT NULL REFERENCES audio_streams(stream_id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX target_decodes_target_idx ON target_decodes(target_id, created_at);
+
+CREATE TABLE target_analyses (
+    target_analysis_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL REFERENCES targets(target_id),
+    decode_id TEXT NOT NULL REFERENCES target_decodes(decode_id),
+    cache_key TEXT NOT NULL UNIQUE,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id),
+    bundle_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX target_analyses_target_idx ON target_analyses(target_id, created_at);
+
+CREATE TABLE target_views (
+    view_id TEXT PRIMARY KEY,
+    target_analysis_id TEXT NOT NULL REFERENCES target_analyses(target_analysis_id),
+    target_id TEXT NOT NULL REFERENCES targets(target_id),
+    representation_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    source_role TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX target_views_target_idx ON target_views(target_id, target_analysis_id);
+"""
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -234,6 +318,22 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (1, utc_now()),
             )
+            migration = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 2"
+            ).fetchone()
+            if migration is None:
+                connection.executescript(MIGRATION_002)
+                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise RuntimeError(
+                        f"schema migration 2 produced {len(violations)} foreign-key violation(s)"
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (2, utc_now()),
+                )
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -333,6 +433,28 @@ class Workspace:
         else:
             value = payload
         data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        schema_version = "0.0.1"
+        if isinstance(value, dict) and isinstance(value.get("schema_version"), str):
+            schema_version = str(value["schema_version"])
+        return self.store_artifact_bytes(
+            data,
+            artifact_type=artifact_type,
+            media_type="application/json",
+            schema_version=schema_version,
+            analysis_run_id=analysis_run_id,
+        )
+
+    def store_artifact_bytes(
+        self,
+        data: bytes,
+        *,
+        artifact_type: str,
+        media_type: str,
+        schema_version: str = "0.0.2",
+        analysis_run_id: str | None = None,
+    ) -> str:
+        """Store an immutable non-asset artifact such as a compressed evidence grid."""
+
         digest, path = self.blobs.put_bytes(data)
         artifact_id = new_id("artifact")
         self.database.execute(
@@ -345,9 +467,9 @@ class Workspace:
                 artifact_id,
                 analysis_run_id,
                 artifact_type,
-                "0.0.1",
+                schema_version,
                 digest,
-                "application/json",
+                media_type,
                 len(data),
                 str(path.relative_to(self.root)),
                 utc_now(),
@@ -381,7 +503,7 @@ class Workspace:
                 run_id,
                 operation,
                 json.dumps(parameters, sort_keys=True),
-                "0.0.1",
+                "0.0.2",
                 "running",
                 utc_now(),
             ),

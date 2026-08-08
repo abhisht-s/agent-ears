@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "music-locator"
-version = "0.0.1"
+version = "0.0.2"
 description = "Evidence-preserving local melodic passage locator"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

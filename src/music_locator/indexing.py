@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Collection
 from pathlib import Path
 
 from music_locator.models import (
+    AudioTargetArtifact,
     IndexSnapshot,
     TargetIndexEntry,
     TargetTrackRepresentation,
@@ -24,17 +26,117 @@ from music_locator.voice_extraction import EXTRACTION_VERSION, extract_monophoni
 DEFAULT_SHINGLE_SIZE = 3
 
 
-def build_index(workspace: Workspace, *, shingle_size: int = DEFAULT_SHINGLE_SIZE) -> str:
+def _index_representation(
+    *,
+    representation: TargetTrackRepresentation,
+    representation_artifact_id: str,
+    entries: list[TargetIndexEntry],
+    inverted: dict[str, list[str]],
+    shingle_size: int,
+) -> None:
+    """Add one already-persisted matcher-facing view to an index.
+
+    ``view_id`` is the stable selector for real-audio hypotheses.  MIDI keeps
+    its existing voice identifier, so old snapshots and posting semantics stay
+    valid.
+    """
+
+    hypothesis = representation.voice_hypothesis
+    selector = representation.view_id or (hypothesis.voice_id if hypothesis is not None else None)
+    if selector is None:
+        raise ValueError("target representation has neither a view nor voice identifier")
+    if "|" in selector:
+        raise ValueError("target view/voice identifiers may not contain '|'")
+    entries.append(
+        TargetIndexEntry(
+            target_id=representation.target_id,
+            track_index=representation.track_index,
+            event_count=len(representation.event_ids),
+            representation_artifact_id=representation_artifact_id,
+            voice_id=selector,
+            view_id=representation.view_id,
+            source_channel=(hypothesis.source_channel if hypothesis is not None else None),
+        )
+    )
+    keys = shingle_keys(
+        [float(value) for value in representation.interval_cents],
+        list(representation.contour_steps),
+        [value / 1_000.0 for value in representation.log_ioi_milli],
+        shingle_size,
+    )
+    keys.extend(phrase_shingle_keys([float(value) for value in representation.pitch_cents]))
+    for position, key in keys:
+        inverted[key].append(f"{representation.target_id}|{selector}|{position}")
+
+
+def build_index(
+    workspace: Workspace,
+    *,
+    shingle_size: int = DEFAULT_SHINGLE_SIZE,
+    target_ids: Collection[str] | None = None,
+) -> str:
     workspace.initialize()
     index_id = new_id("index")
     entries: list[TargetIndexEntry] = []
     inverted: dict[str, list[str]] = defaultdict(list)
     target_fingerprints: list[str] = []
     direct_count = 0
-    for target, target_artifact_id in list_targets(workspace):
+    audio_view_count = 0
+    requested_target_ids = set(target_ids) if target_ids is not None else None
+    targets = [
+        item
+        for item in list_targets(workspace)
+        if requested_target_ids is None or item[0].target_id in requested_target_ids
+    ]
+    if requested_target_ids is not None:
+        found_target_ids = {target.target_id for target, _ in targets}
+        missing_target_ids = sorted(requested_target_ids - found_target_ids)
+        if missing_target_ids:
+            raise KeyError(f"unknown target(s): {', '.join(missing_target_ids)}")
+    for target, target_artifact_id in targets:
         target_fingerprints.append(
             f"{target.target_id}:{target_artifact_id}:{target.source_sha256}"
         )
+        if isinstance(target, AudioTargetArtifact):
+            # Target analysis is deliberately separate from indexing.  Indexing
+            # consumes only a completed, durable evidence bundle and never
+            # invokes an extractor implicitly.
+            from music_locator.target_audio import load_latest_target_bundle
+
+            bundle, bundle_artifact_id, target_analysis_id = load_latest_target_bundle(
+                workspace, target.target_id
+            )
+            target_fingerprints.append(
+                ":".join(
+                    (
+                        target.target_id,
+                        bundle_artifact_id,
+                        target_analysis_id,
+                        bundle.cache_key,
+                    )
+                )
+            )
+            seen_view_ids: set[str] = set()
+            for representation_artifact_id in bundle.representation_artifact_ids:
+                representation = load_track_representation(workspace, representation_artifact_id)
+                if representation.target_id != target.target_id:
+                    raise ValueError(
+                        "audio representation target does not match its analysis bundle"
+                    )
+                if representation.view_id is None:
+                    raise ValueError("audio target representations require a stable view_id")
+                if representation.view_id in seen_view_ids:
+                    raise ValueError(f"duplicate audio target view_id: {representation.view_id}")
+                seen_view_ids.add(representation.view_id)
+                _index_representation(
+                    representation=representation,
+                    representation_artifact_id=representation_artifact_id,
+                    entries=entries,
+                    inverted=inverted,
+                    shingle_size=shingle_size,
+                )
+                audio_view_count += 1
+            continue
         for voice in extract_monophonic_voices(target):
             notes = voice.notes
             hypothesis = voice.hypothesis
@@ -58,33 +160,25 @@ def build_index(workspace: Workspace, *, shingle_size: int = DEFAULT_SHINGLE_SIZ
             representation_artifact_id = workspace.store_json_artifact(
                 representation, artifact_type="index.target_track_representation"
             )
-            entries.append(
-                TargetIndexEntry(
-                    target_id=target.target_id,
-                    track_index=hypothesis.source_track_index,
-                    event_count=len(notes),
-                    representation_artifact_id=representation_artifact_id,
-                    voice_id=hypothesis.voice_id,
-                    source_channel=hypothesis.source_channel,
-                )
+            _index_representation(
+                representation=representation,
+                representation_artifact_id=representation_artifact_id,
+                entries=entries,
+                inverted=inverted,
+                shingle_size=shingle_size,
             )
-            keys = shingle_keys(
-                [float(value) for value in representation.interval_cents],
-                list(representation.contour_steps),
-                [value / 1_000.0 for value in representation.log_ioi_milli],
-                shingle_size,
-            )
-            keys.extend(
-                phrase_shingle_keys(
-                    [float(value) for value in representation.pitch_cents]
-                )
-            )
-            for position, key in keys:
-                inverted[key].append(f"{target.target_id}|{hypothesis.voice_id}|{position}")
     sorted_entries = tuple(
-        sorted(entries, key=lambda item: (item.target_id, item.track_index, item.voice_id))
+        sorted(
+            entries,
+            key=lambda item: (
+                item.target_id,
+                -1 if item.track_index is None else item.track_index,
+                item.view_id or item.voice_id,
+            ),
+        )
     )
     snapshot = IndexSnapshot(
+        schema_version="0.0.2" if audio_view_count else "0.0.1",
         index_id=index_id,
         created_at=utc_now(),
         target_entries=sorted_entries,
@@ -98,7 +192,8 @@ def build_index(workspace: Workspace, *, shingle_size: int = DEFAULT_SHINGLE_SIZ
             "voice_extraction_version": EXTRACTION_VERSION,
             "indexed_voice_count": len(sorted_entries),
             "source_monophonic_voice_count": direct_count,
-            "derived_voice_count": len(sorted_entries) - direct_count,
+            "derived_voice_count": len(sorted_entries) - direct_count - audio_view_count,
+            "audio_view_count": audio_view_count,
         },
     )
     artifact_id = workspace.store_json_artifact(snapshot, artifact_type="index.snapshot")

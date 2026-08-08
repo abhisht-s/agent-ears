@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 
@@ -16,9 +17,11 @@ from music_locator.audio import (
 from music_locator.indexing import load_index, load_track_representation
 from music_locator.models import (
     AlignmentArtifact,
+    AudioTargetArtifact,
     CandidateEvidence,
     IndexSnapshot,
     MatchAlternative,
+    MediaMicrosecondRange,
     MicrosecondRange,
     ProvenanceEvidence,
     QualityWarning,
@@ -26,6 +29,10 @@ from music_locator.models import (
     ResultStatus,
     SampleRange,
     SearchResult,
+    TargetArtifact,
+    TargetCoordinateKind,
+    TargetRepresentationBundle,
+    TargetTimeMap,
     TargetTrackRepresentation,
     TickRange,
     VoiceHypothesis,
@@ -35,6 +42,159 @@ from music_locator.representation import phrase_shingle_keys, shingle_keys
 from music_locator.storage import Workspace, new_id, utc_now
 from music_locator.targets import load_target
 from music_locator.timebase import tick_to_microseconds
+
+
+@dataclass(frozen=True)
+class _TargetLocation:
+    target: TargetArtifact | AudioTargetArtifact
+    target_artifact_id: str
+    coordinate_kind: TargetCoordinateKind
+    tick_range: TickRange | None
+    sample_range: SampleRange | None
+    time_range: MicrosecondRange | MediaMicrosecondRange
+    target_analysis_artifact_id: str | None = None
+    decode_manifest_artifact_id: str | None = None
+    time_map_artifact_id: str | None = None
+    evidence_artifact_id: str | None = None
+
+
+def _load_audio_bundle_for_representation(
+    workspace: Workspace,
+    *,
+    target_id: str,
+    representation_artifact_id: str,
+) -> tuple[TargetRepresentationBundle, str]:
+    """Resolve the evidence bundle that was actually indexed, not merely latest.
+
+    The exact representation-to-analysis relationship is durable in
+    ``target_views``.  The fallback supports early/migrated workspaces while
+    still refusing to attach a representation to an unrelated newer bundle.
+    """
+
+    row = workspace.database.fetchone(
+        """
+        SELECT target_analyses.bundle_artifact_id
+        FROM target_views
+        JOIN target_analyses
+          ON target_analyses.target_analysis_id = target_views.target_analysis_id
+        WHERE target_views.target_id = ?
+          AND target_views.representation_artifact_id = ?
+        ORDER BY target_analyses.created_at DESC
+        LIMIT 1
+        """,
+        (target_id, representation_artifact_id),
+    )
+    if row is not None:
+        bundle_artifact_id = str(row["bundle_artifact_id"])
+        bundle = TargetRepresentationBundle.model_validate(
+            workspace.load_artifact_json(bundle_artifact_id)
+        )
+    else:
+        from music_locator.target_audio import load_latest_target_bundle
+
+        bundle, bundle_artifact_id, _ = load_latest_target_bundle(workspace, target_id)
+    if bundle.target_id != target_id:
+        raise ValueError("audio representation bundle belongs to a different target")
+    if representation_artifact_id not in bundle.representation_artifact_ids:
+        raise ValueError("indexed audio representation is absent from its evidence bundle")
+    return bundle, bundle_artifact_id
+
+
+def _target_location(
+    workspace: Workspace,
+    *,
+    representation: TargetTrackRepresentation,
+    representation_artifact_id: str,
+    start_index: int,
+    end_index: int,
+) -> _TargetLocation:
+    """Map one aligned event window into its native target coordinates."""
+
+    target, target_artifact_id = load_target(workspace, representation.target_id)
+    if end_index <= start_index:
+        raise ValueError("target alignment window must contain at least one event")
+    if representation.coordinate_kind == TargetCoordinateKind.MIDI_TICKS:
+        if isinstance(target, AudioTargetArtifact):
+            raise ValueError("audio target cannot use MIDI tick coordinates")
+        tick_range = TickRange(
+            start_tick=representation.start_ticks[start_index],
+            end_tick=representation.end_ticks[end_index - 1],
+            ticks_per_beat=target.ticks_per_beat,
+        )
+        return _TargetLocation(
+            target=target,
+            target_artifact_id=target_artifact_id,
+            coordinate_kind=TargetCoordinateKind.MIDI_TICKS,
+            tick_range=tick_range,
+            sample_range=None,
+            time_range=MicrosecondRange(
+                start_microsecond=tick_to_microseconds(
+                    tick_range.start_tick, target.ticks_per_beat, target.tempo_map
+                ),
+                end_microsecond=tick_to_microseconds(
+                    tick_range.end_tick, target.ticks_per_beat, target.tempo_map
+                ),
+            ),
+        )
+    if not isinstance(target, AudioTargetArtifact):
+        raise ValueError("MIDI/timed-note target cannot use decoded sample coordinates")
+    bundle, bundle_artifact_id = _load_audio_bundle_for_representation(
+        workspace,
+        target_id=target.target_id,
+        representation_artifact_id=representation_artifact_id,
+    )
+    target_time_map = TargetTimeMap.model_validate(
+        workspace.load_artifact_json(bundle.target_time_map_artifact_id)
+    )
+    if representation.reference_sample_rate != target_time_map.decoded_sample_rate:
+        raise ValueError("audio representation sample rate disagrees with its target time map")
+    if (
+        representation.reference_zero_media_microseconds is not None
+        and representation.reference_zero_media_microseconds
+        != target_time_map.reference_zero_media_microseconds
+    ):
+        raise ValueError("audio representation media origin disagrees with its target time map")
+    sample_range = SampleRange(
+        start_sample=representation.start_samples[start_index],
+        end_sample=representation.end_samples[end_index - 1],
+        sample_rate=target_time_map.decoded_sample_rate,
+    )
+    audio_hypothesis = representation.audio_voice_hypothesis
+    return _TargetLocation(
+        target=target,
+        target_artifact_id=target_artifact_id,
+        coordinate_kind=TargetCoordinateKind.DECODED_SAMPLES,
+        tick_range=None,
+        sample_range=sample_range,
+        time_range=MediaMicrosecondRange(
+            start_microsecond=target_time_map.reference_sample_to_media_microseconds(
+                sample_range.start_sample
+            ),
+            end_microsecond=target_time_map.reference_sample_to_media_microseconds(
+                sample_range.end_sample
+            ),
+        ),
+        target_analysis_artifact_id=bundle_artifact_id,
+        decode_manifest_artifact_id=bundle.decode_manifest_artifact_id,
+        time_map_artifact_id=bundle.target_time_map_artifact_id,
+        evidence_artifact_id=(
+            audio_hypothesis.evidence_artifact_id if audio_hypothesis is not None else None
+        ),
+    )
+
+
+def _sample_overlap(left: SampleRange, right: SampleRange) -> float:
+    if left.sample_rate != right.sample_rate:
+        return 0.0
+    overlap = max(
+        0,
+        min(left.end_sample, right.end_sample) - max(left.start_sample, right.start_sample),
+    )
+    shorter = min(
+        left.end_sample - left.start_sample,
+        right.end_sample - right.start_sample,
+    )
+    return overlap / max(1, shorter)
 
 
 def _shingle_view_weight(key: str) -> float:
@@ -60,9 +220,7 @@ def _weighted_shingle_vote(
     posting_count: int,
     query_quality: float,
 ) -> float:
-    inverse_frequency = 1.0 + math.log(
-        (1.0 + indexed_positions) / (1.0 + posting_count)
-    )
+    inverse_frequency = 1.0 + math.log((1.0 + indexed_positions) / (1.0 + posting_count))
     return _shingle_view_weight(key) * inverse_frequency * (0.5 + 0.5 * query_quality)
 
 
@@ -118,18 +276,18 @@ def _candidate_retrieval(
         int(snapshot.parameters["shingle_size"]),
     )
     if "phrase_shingles" in snapshot.parameters:
-        query_keys.extend(
-            phrase_shingle_keys(
-                [event.pitch_midi_cents for event in query.events]
-            )
-        )
+        query_keys.extend(phrase_shingle_keys([event.pitch_midi_cents for event in query.events]))
     votes: dict[tuple[str, str, int], int] = defaultdict(int)
     weighted_votes: dict[tuple[str, str, int], float] = defaultdict(float)
     evidence: dict[tuple[str, str, int], set[str]] = defaultdict(set)
     indexed_positions = max(1, sum(entry.event_count for entry in snapshot.target_entries))
 
     for query_position, key in query_keys:
-        postings = snapshot.shingles.get(key, ())
+        postings = tuple(
+            posting
+            for posting in snapshot.shingles.get(key, ())
+            if tuple(posting.split("|")[:2]) in representations
+        )
         if not postings:
             continue
         query_quality = query.events[min(query_position, len(query.events) - 1)].quality_weight
@@ -166,12 +324,11 @@ def _candidate_retrieval(
                 matched_shingles=tuple(sorted(evidence[(target_id, voice_id, start)])),
                 weighted_shingle_score=weighted_votes[(target_id, voice_id, start)],
                 voice_id=voice_id,
-                source_channel=hypothesis.source_channel if hypothesis is not None else 0,
+                view_id=representation.view_id,
+                source_channel=hypothesis.source_channel if hypothesis is not None else None,
             )
         )
-    represented = {
-        (item.target_id, item.voice_id, item.start_event_index) for item in candidates
-    }
+    represented = {(item.target_id, item.voice_id, item.start_event_index) for item in candidates}
     fallback_starts: dict[tuple[str, str], list[int]] = {}
     for representation_key, representation in sorted(representations.items()):
         fallback_starts[representation_key] = list(
@@ -195,8 +352,9 @@ def _candidate_retrieval(
                         shingle_votes=0,
                         matched_shingles=(),
                         voice_id=voice_id,
+                        view_id=representation.view_id,
                         source_channel=(
-                            hypothesis.source_channel if hypothesis is not None else 0
+                            hypothesis.source_channel if hypothesis is not None else None
                         ),
                     )
                 )
@@ -248,18 +406,27 @@ def _persist_result(
     return result
 
 
-def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
+def search(
+    workspace: Workspace,
+    query_id: str,
+    index_id: str,
+    *,
+    target_id: str | None = None,
+) -> SearchResult:
     workspace.initialize()
     analysis, query_analysis_artifact_id = load_query_analysis(workspace, query_id)
     search_id = new_id("search")
+    run_parameters = {
+        "query_id": query_id,
+        "index_id": index_id,
+        "matcher": "open_target_dp_v1_structural_score_v1",
+        "interpretation_policy": "all_usable_interpretations_v1",
+    }
+    if target_id is not None:
+        run_parameters["target_id"] = target_id
     run_id = workspace.create_analysis_run(
         "search",
-        {
-            "query_id": query_id,
-            "index_id": index_id,
-            "matcher": "open_target_dp_v1_structural_score_v1",
-            "interpretation_policy": "all_usable_interpretations_v1",
-        },
+        run_parameters,
     )
     interpretation_id = analysis.selected_interpretation_id
     workspace.database.execute(
@@ -286,8 +453,7 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         workspace.finish_analysis_run(run_id)
         return _persist_result(workspace, search_id, result, run_id)
     source_interpretations = [
-        load_interpretation(workspace, item_id)[0]
-        for item_id in analysis.interpretation_ids
+        load_interpretation(workspace, item_id)[0] for item_id in analysis.interpretation_ids
     ]
     prepared_interpretations: list[tuple[QueryInterpretation, str, str]] = []
     evaluated_source_interpretation_ids: list[str] = []
@@ -299,15 +465,11 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
             analysis_run_id=run_id,
         )
         if len(prepared.events) >= 3:
-            evaluated_source_interpretation_ids.append(
-                source_interpretation.interpretation_id
-            )
+            evaluated_source_interpretation_ids.append(source_interpretation.interpretation_id)
             prepared_interpretations.append(
                 (prepared, artifact_id, source_interpretation.interpretation_id)
             )
-    deduplicated: dict[
-        tuple[tuple[int, int, int], ...], tuple[QueryInterpretation, str, str]
-    ] = {}
+    deduplicated: dict[tuple[tuple[int, int, int], ...], tuple[QueryInterpretation, str, str]] = {}
     for prepared_item in prepared_interpretations:
         prepared = prepared_item[0]
         signature = tuple(
@@ -334,14 +496,29 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         workspace.finish_analysis_run(run_id)
         return _persist_result(workspace, search_id, result, run_id)
     index, index_artifact_id = load_index(workspace, index_id)
+    if target_id is not None:
+        scoped_entries = tuple(
+            entry for entry in index.target_entries if entry.target_id == target_id
+        )
+        index = index.model_copy(update={"target_entries": scoped_entries})
     if not index.target_entries:
+        reason = (
+            "requested_target_not_present_in_index"
+            if target_id is not None
+            else "index_has_no_usable_pitched_voice_candidates"
+        )
+        explanation = (
+            "The requested target has no indexed pitched audio or MIDI views."
+            if target_id is not None
+            else "The index contains no source or derived monophonic pitched voice candidates."
+        )
         result = _typed_early_result(
             workspace,
             query_id,
             search_id,
             ResultStatus.UNSUPPORTED_TARGET,
-            ("index_has_no_usable_pitched_voice_candidates",),
-            "The index contains no source or derived monophonic pitched voice candidates.",
+            (reason,),
+            explanation,
             analysis.quality.warnings,
         )
         workspace.finish_analysis_run(run_id)
@@ -362,9 +539,13 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         workspace.finish_analysis_run(run_id)
         return _persist_result(workspace, search_id, result, run_id)
     representations = {
-        (entry.target_id, entry.voice_id): load_track_representation(
+        (entry.target_id, entry.view_id or entry.voice_id): load_track_representation(
             workspace, entry.representation_artifact_id
         )
+        for entry in index.target_entries
+    }
+    representation_artifact_ids = {
+        (entry.target_id, entry.view_id or entry.voice_id): entry.representation_artifact_id
         for entry in index.target_entries
     }
     computations: list[
@@ -385,7 +566,8 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
             limit=24,
         )
         for candidate in candidates:
-            representation = representations[(candidate.target_id, candidate.voice_id)]
+            selector = candidate.view_id or candidate.voice_id
+            representation = representations[(candidate.target_id, selector)]
             try:
                 computation = align_candidate(prepared, representation, candidate)
             except ValueError:
@@ -460,36 +642,38 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         prepared_artifact_id,
         source_interpretation_id,
     ) in enumerate(computations[:24], start=1):
-        target, _ = load_target(workspace, candidate.target_id)
+        selector = candidate.view_id or candidate.voice_id
+        location = _target_location(
+            workspace,
+            representation=representation,
+            representation_artifact_id=representation_artifact_ids[(candidate.target_id, selector)],
+            start_index=computation.start_index,
+            end_index=computation.end_index,
+        )
         alignment_id = new_id("alignment")
-        target_range = TickRange(
-            start_tick=representation.start_ticks[computation.start_index],
-            end_tick=representation.end_ticks[computation.end_index - 1],
-            ticks_per_beat=target.ticks_per_beat,
-        )
-        target_time_range = MicrosecondRange(
-            start_microsecond=tick_to_microseconds(
-                target_range.start_tick, target.ticks_per_beat, target.tempo_map
-            ),
-            end_microsecond=tick_to_microseconds(
-                target_range.end_tick, target.ticks_per_beat, target.tempo_map
-            ),
-        )
         artifact = AlignmentArtifact(
+            schema_version=(
+                "0.0.2"
+                if location.coordinate_kind == TargetCoordinateKind.DECODED_SAMPLES
+                else "0.0.1"
+            ),
             alignment_id=alignment_id,
             search_id=search_id,
-            target_id=target.target_id,
+            target_id=location.target.target_id,
             track_index=candidate.track_index,
             target_event_start_index=computation.start_index,
             target_event_end_index=computation.end_index,
-            target_range=target_range,
-            target_time_range=target_time_range,
+            coordinate_kind=location.coordinate_kind,
+            target_range=location.tick_range,
+            target_sample_range=location.sample_range,
+            target_time_range=location.time_range,
             candidate=candidate,
             aligned_events=computation.pairs,
             transformations=computation.transformations,
             score=computation.score,
             contour_dtw_cost=computation.dtw_cost,
             voice_hypothesis=_voice_summary(representation.voice_hypothesis),
+            audio_voice_hypothesis=representation.audio_voice_hypothesis,
             query_interpretation_id=prepared.interpretation_id,
             query_interpretation_artifact_id=prepared_artifact_id,
         )
@@ -505,7 +689,7 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
             (
                 alignment_id,
                 search_id,
-                target.target_id,
+                location.target.target_id,
                 rank,
                 artifact_id,
                 computation.score.value,
@@ -536,7 +720,19 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         "UPDATE searches SET interpretation_id = ? WHERE search_id = ?",
         (best_source_interpretation_id, search_id),
     )
-    best_target, best_target_artifact_id = load_target(workspace, best_candidate.target_id)
+    best_selector = best_candidate.view_id or best_candidate.voice_id
+    best_representation_artifact_id = representation_artifact_ids[
+        (best_candidate.target_id, best_selector)
+    ]
+    best_location = _target_location(
+        workspace,
+        representation=best_representation,
+        representation_artifact_id=best_representation_artifact_id,
+        start_index=best.start_index,
+        end_index=best.end_index,
+    )
+    best_target = best_location.target
+    best_target_artifact_id = best_location.target_artifact_id
     best_target_row = workspace.database.fetchone(
         "SELECT source_asset_id FROM targets WHERE target_id = ?", (best_target.target_id,)
     )
@@ -547,25 +743,16 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         raise RuntimeError("selected evidence rows disappeared during search")
     target_asset = workspace.asset_row(str(best_target_row["source_asset_id"]))
     query_asset = workspace.asset_row(str(query_row["original_asset_id"]))
-    best_range = TickRange(
-        start_tick=best_representation.start_ticks[best.start_index],
-        end_tick=best_representation.end_ticks[best.end_index - 1],
-        ticks_per_beat=best_target.ticks_per_beat,
-    )
-    best_time_range = MicrosecondRange(
-        start_microsecond=tick_to_microseconds(
-            best_range.start_tick, best_target.ticks_per_beat, best_target.tempo_map
-        ),
-        end_microsecond=tick_to_microseconds(
-            best_range.end_tick, best_target.ticks_per_beat, best_target.tempo_map
-        ),
-    )
+    best_range = best_location.tick_range
+    best_sample_range = best_location.sample_range
+    best_time_range = best_location.time_range
     distinct_alternatives: list[MatchAlternative] = []
     best_signature = tuple(best_representation.event_ids[best.start_index : best.end_index])
     best_signature_set = set(best_signature)
-    seen_ranges: set[tuple[str, tuple[str, ...]]] = {
-        (best_candidate.target_id, best_signature)
-    }
+    seen_ranges: set[tuple[str, tuple[str, ...]]] = {(best_candidate.target_id, best_signature)}
+    audio_occurrences: list[tuple[str, SampleRange]] = (
+        [(best_candidate.target_id, best_sample_range)] if best_sample_range is not None else []
+    )
     competing_occurrence_score = 0.0
     close_distinct_voice = False
     for (
@@ -577,19 +764,15 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         alternative_source_interpretation_id,
         _,
     ) in alignment_records[1:]:
-        target, _ = load_target(workspace, candidate.target_id)
-        target_range = TickRange(
-            start_tick=representation.start_ticks[computation.start_index],
-            end_tick=representation.end_ticks[computation.end_index - 1],
-            ticks_per_beat=target.ticks_per_beat,
-        )
-        target_time_range = MicrosecondRange(
-            start_microsecond=tick_to_microseconds(
-                target_range.start_tick, target.ticks_per_beat, target.tempo_map
-            ),
-            end_microsecond=tick_to_microseconds(
-                target_range.end_tick, target.ticks_per_beat, target.tempo_map
-            ),
+        alternative_selector = candidate.view_id or candidate.voice_id
+        alternative_location = _target_location(
+            workspace,
+            representation=representation,
+            representation_artifact_id=representation_artifact_ids[
+                (candidate.target_id, alternative_selector)
+            ],
+            start_index=computation.start_index,
+            end_index=computation.end_index,
         )
         range_key = (
             candidate.target_id,
@@ -602,8 +785,20 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         event_overlap = len(best_signature_set & alternative_signature_set) / max(
             1, min(len(best_signature_set), len(alternative_signature_set))
         )
-        same_source_voice_path = (
-            candidate.target_id == best_candidate.target_id
+        same_audio_occurrence = alternative_location.sample_range is not None and any(
+            candidate.target_id == occurrence_target_id
+            and _sample_overlap(occurrence_range, alternative_location.sample_range) >= 0.5
+            for occurrence_target_id, occurrence_range in audio_occurrences
+        )
+        if same_audio_occurrence:
+            # Different extraction paths often describe the same real-world
+            # passage.  Treat them as corroborating views rather than distinct
+            # occurrences that would manufacture an ambiguous result.
+            continue
+        same_source_voice_path = same_audio_occurrence or (
+            best_range is not None
+            and alternative_location.tick_range is not None
+            and candidate.target_id == best_candidate.target_id
             and candidate.track_index == best_candidate.track_index
             and candidate.source_channel == best_candidate.source_channel
             and event_overlap >= 0.5
@@ -617,19 +812,24 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         ):
             close_distinct_voice = True
         alternative = MatchAlternative(
-                rank=len(distinct_alternatives) + 2,
-                target_id=target.target_id,
-                target_name=target.name,
-                track_index=candidate.track_index,
-                target_range=target_range,
-                target_time_range=target_time_range,
-                score=computation.score,
-                transformations=computation.transformations,
-                candidate=candidate,
-                source_channel=candidate.source_channel,
-                voice_hypothesis=_voice_summary(representation.voice_hypothesis),
-                query_interpretation_id=alternative_source_interpretation_id,
-            )
+            rank=len(distinct_alternatives) + 2,
+            target_id=alternative_location.target.target_id,
+            target_name=alternative_location.target.name,
+            track_index=candidate.track_index,
+            coordinate_kind=alternative_location.coordinate_kind,
+            target_range=alternative_location.tick_range,
+            target_sample_range=alternative_location.sample_range,
+            target_time_range=alternative_location.time_range,
+            score=computation.score,
+            transformations=computation.transformations,
+            candidate=candidate,
+            source_channel=candidate.source_channel,
+            voice_hypothesis=_voice_summary(representation.voice_hypothesis),
+            audio_voice_hypothesis=representation.audio_voice_hypothesis,
+            query_interpretation_id=alternative_source_interpretation_id,
+        )
+        if alternative_location.sample_range is not None:
+            audio_occurrences.append((candidate.target_id, alternative_location.sample_range))
         if len(distinct_alternatives) < 5:
             distinct_alternatives.append(alternative)
     score_margin = best.score.value - competing_occurrence_score
@@ -641,7 +841,11 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         status = ResultStatus.AMBIGUOUS
         reason_codes = ("top_two_score_margin_too_small",)
         explanation = (
-            "Multiple distinct passages or source voices explain the query nearly equally well."
+            "Multiple distinct real-audio passages explain the query nearly equally well."
+            if best_location.coordinate_kind == TargetCoordinateKind.DECODED_SAMPLES
+            else (
+                "Multiple distinct passages or source voices explain the query nearly equally well."
+            )
         )
     else:
         status = ResultStatus.ACCEPTED
@@ -655,18 +859,32 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
             if best.start_index <= index < best.end_index
         }
     )
-    velocities = [best_representation.velocities[index] for index in matched_target_indices]
-    velocity_floor = median(velocities) if velocities else 0
-    strong_ticks = tuple(
-        best_representation.start_ticks[index]
-        for index in matched_target_indices
-        if best_representation.velocities[index] >= velocity_floor
-    )
+    if best_location.coordinate_kind == TargetCoordinateKind.MIDI_TICKS:
+        velocities = [best_representation.velocities[index] for index in matched_target_indices]
+        velocity_floor = median(velocities) if velocities else 0
+        strong_ticks = tuple(
+            best_representation.start_ticks[index]
+            for index in matched_target_indices
+            if best_representation.velocities[index] >= velocity_floor
+        )
+        strong_samples: tuple[int, ...] = ()
+    else:
+        confidences = (
+            [best_representation.event_confidences[index] for index in matched_target_indices]
+            if best_representation.event_confidences
+            else [1.0 for _ in matched_target_indices]
+        )
+        confidence_floor = median(confidences) if confidences else 0.0
+        strong_ticks = ()
+        strong_samples = tuple(
+            best_representation.start_samples[index]
+            for index, confidence in zip(matched_target_indices, confidences, strict=True)
+            if confidence >= confidence_floor
+        )
     selected_entry = next(
         entry
         for entry in index.target_entries
-        if entry.target_id == best_candidate.target_id
-        and entry.voice_id == best_candidate.voice_id
+        if entry.target_id == best_candidate.target_id and entry.voice_id == best_candidate.voice_id
     )
     provenance = ProvenanceEvidence(
         query_asset_id=str(query_asset["asset_id"]),
@@ -681,15 +899,22 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         search_id=search_id,
         alignment_id=best_alignment_id,
         target_representation_artifact_id=selected_entry.representation_artifact_id,
-        target_voice_id=best_candidate.voice_id,
+        target_voice_id=(
+            best_candidate.voice_id
+            if best_location.coordinate_kind == TargetCoordinateKind.MIDI_TICKS
+            else None
+        ),
         search_interpretation_id=best_interpretation.interpretation_id,
         search_interpretation_artifact_id=best_interpretation_artifact_id,
+        target_decode_manifest_artifact_id=best_location.decode_manifest_artifact_id,
+        target_time_map_artifact_id=best_location.time_map_artifact_id,
+        target_analysis_artifact_id=best_location.target_analysis_artifact_id,
+        target_evidence_artifact_id=best_location.evidence_artifact_id,
+        target_view_id=best_representation.view_id,
     )
     result_warnings = list(analysis.quality.warnings)
     excluded_event_ids = tuple(
-        item.source_event_id
-        for item in best_interpretation.event_usability
-        if not item.usable
+        item.source_event_id for item in best_interpretation.event_usability if not item.usable
     )
     if excluded_event_ids:
         result_warnings.append(
@@ -730,15 +955,28 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         result_warnings.append(
             QualityWarning(
                 code=(
-                    "close_derived_voice_hypotheses"
-                    if alternatives_are_derived
-                    else "close_source_voice_candidates"
+                    "close_audio_view_hypotheses"
+                    if best_location.coordinate_kind == TargetCoordinateKind.DECODED_SAMPLES
+                    else (
+                        "close_derived_voice_hypotheses"
+                        if alternatives_are_derived
+                        else "close_source_voice_candidates"
+                    )
                 ),
                 severity="warning",
-                message="Several source voice candidates explain the query with similar scores.",
+                message=(
+                    "Several target evidence views explain distinct passages with similar scores."
+                    if best_location.coordinate_kind == TargetCoordinateKind.DECODED_SAMPLES
+                    else "Several source voice candidates explain the query with similar scores."
+                ),
             )
         )
     result = SearchResult(
+        schema_version=(
+            "0.0.2"
+            if best_location.coordinate_kind == TargetCoordinateKind.DECODED_SAMPLES
+            else "0.0.1"
+        ),
         search_id=search_id,
         status=status,
         reason_codes=reason_codes,
@@ -747,21 +985,39 @@ def search(workspace: Workspace, query_id: str, index_id: str) -> SearchResult:
         selected_target_name=best_target.name,
         selected_track_index=best_candidate.track_index,
         target_range=best_range,
+        target_sample_range=best_sample_range,
         target_time_range=best_time_range,
         query_source_range=_source_range(workspace, query_id),
         score=best.score,
         transformations=best.transformations,
         aligned_events=best.pairs,
         strong_rhythmic_target_ticks=strong_ticks,
+        strong_rhythmic_target_samples=strong_samples,
         alternatives=tuple(distinct_alternatives),
         quality_warnings=tuple(result_warnings),
         provenance=provenance,
         selected_source_channel=best_candidate.source_channel,
         selected_voice_hypothesis=_voice_summary(best_representation.voice_hypothesis),
-        selected_query_interpretation_id=best_source_interpretation_id,
-        evaluated_query_interpretation_ids=tuple(
-            evaluated_source_interpretation_ids
+        selected_audio_voice_hypothesis=best_representation.audio_voice_hypothesis,
+        selected_target_coordinate_kind=best_location.coordinate_kind,
+        selected_target_original_name=(
+            best_target.original_name
+            if isinstance(best_target, AudioTargetArtifact)
+            else str(target_asset["original_name"])
         ),
+        selected_target_view_id=best_representation.view_id,
+        selected_target_source_role=(
+            best_representation.audio_voice_hypothesis.source_role
+            if best_representation.audio_voice_hypothesis is not None
+            else None
+        ),
+        selected_target_backend=(
+            best_representation.audio_voice_hypothesis.extraction_backend
+            if best_representation.audio_voice_hypothesis is not None
+            else None
+        ),
+        selected_query_interpretation_id=best_source_interpretation_id,
+        evaluated_query_interpretation_ids=tuple(evaluated_source_interpretation_ids),
         usable_query_event_ids=tuple(event.event_id for event in best_interpretation.events),
         excluded_query_event_ids=excluded_event_ids,
     )
